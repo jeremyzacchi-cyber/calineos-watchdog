@@ -1,0 +1,83 @@
+name: Sentinelle Calineos
+
+# Contrôle calineos.store, GEST et l'API toutes les 5 minutes (dépôt public : minutes gratuites).
+# En cas de panne, ou au retour du site tant qu'un ticket est ouvert, déclenche le workflow
+# « Surveillance Calineos » du dépôt privé : c'est lui qui ouvre/ferme le ticket (e-mail)
+# et relance le VPS via l'API Hostinger. Aucun secret Hostinger n'est stocké ici.
+# Secret requis : CALINEOS_DISPATCH_TOKEN (jeton fin limité au dépôt calineos :
+# Actions en lecture/écriture, Issues en lecture).
+on:
+  schedule:
+    - cron: "*/5 * * * *"
+  workflow_dispatch:
+
+permissions:
+  actions: write
+  contents: read
+
+concurrency:
+  group: sentinelle
+  cancel-in-progress: false
+
+env:
+  TARGET_REPO: jeremyzacchi-cyber/calineos
+  TARGET_WORKFLOW: surveillance.yml
+
+jobs:
+  controle:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Contrôler et alerter
+        env:
+          DISPATCH_TOKEN: ${{ secrets.CALINEOS_DISPATCH_TOKEN }}
+        run: |
+          set -uo pipefail
+          [[ -n "$DISPATCH_TOKEN" ]] || { echo "::error::Secret CALINEOS_DISPATCH_TOKEN absent."; exit 1; }
+
+          # En ligne si 2xx/3xx sur l'un des 3 essais espacés de 30 s.
+          up() {
+            local code
+            for attempt in 1 2 3; do
+              code="$(curl -sS -o /dev/null -w '%{http_code}' -L --max-time 20 -A 'Calineos-Sentinelle/1.0' "$1" 2>/dev/null || true)"
+              [[ "$code" =~ ^[23] ]] && { echo "OK  $1 HTTP $code"; return 0; }
+              [[ $attempt -lt 3 ]] && sleep 30
+            done
+            echo "KO  $1 HTTP ${code:-000}"
+            return 1
+          }
+
+          down=0
+          for url in https://api.calineos.store/ready https://calineos.store/ https://gest.calineos.store/login; do
+            up "$url" &
+          done > results.txt
+          wait
+          cat results.txt
+          grep -q '^KO' results.txt && down=1
+
+          api() { curl -sS --max-time 30 -H "Authorization: Bearer $DISPATCH_TOKEN" -H 'Accept: application/vnd.github+json' "$@"; }
+
+          open_issues="$(api "https://api.github.com/repos/$TARGET_REPO/issues?labels=panne-site&state=open&per_page=1" | jq 'if type == "array" then length else -1 end')"
+          if [[ "$open_issues" == "-1" ]]; then
+            echo "::error::Jeton CALINEOS_DISPATCH_TOKEN refusé par GitHub."
+            exit 1
+          fi
+
+          if (( down == 1 )) || (( open_issues > 0 )); then
+            status="$(api -o /dev/null -w '%{http_code}' -X POST \
+              "https://api.github.com/repos/$TARGET_REPO/actions/workflows/$TARGET_WORKFLOW/dispatches" \
+              -d '{"ref":"main","inputs":{"relance":"auto","source":"Sentinelle 5 min"}}')"
+            echo "Surveillance du dépôt privé déclenchée (HTTP $status)."
+            [[ "$status" == "204" ]] || exit 1
+          fi
+          (( down == 0 )) || exit 1
+
+      # GitHub désactive les tâches planifiées d'un dépôt public sans activité depuis 60 jours :
+      # une réactivation quotidienne remet ce compteur à zéro.
+      - name: Rester actif
+        if: github.event_name == 'schedule' && always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          [[ "$(date -u +%H)" == "00" ]] || exit 0
+          gh api -X PUT "repos/${{ github.repository }}/actions/workflows/sentinelle.yml/enable" && echo "Planification réactivée."
